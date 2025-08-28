@@ -77,9 +77,6 @@ class MultiHeadAttention(nn.Module):
         self.w_o = nn.Linear(d_model,d_model)
         self.dropout = nn.Dropout(dropout)
         
-    @staticmethod
-    def attn(self,key,value):
-        
     def forward(self,Q,K,V,mask):
         query = self.w_q(Q)
         key = self.w_k(K)
