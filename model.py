@@ -48,7 +48,7 @@ class LayerNorm(nn.Module):
     def __init__(self, hidden_dim: int, eps: float = 1e-6):
         super().__init__()
         # this creates per-feature gamma (weight) and beta (bias)
-        self.norm = nn.LayerNorm(hidden_dim, eps=eps)
+        self.norm = nn.LayerNorm(hidden_dim, eps)
 
     def forward(self, x):
         return self.norm(x)
@@ -87,7 +87,7 @@ class MultiHeadAttention(nn.Module):
         attention_score = attention_score.softmax(dim=-1)
         if dropout is not None:
             attention_score = dropout(attention_score)
-        return (attention_score),attention_score
+        return (attention_score @ value),attention_score
                                                                                   
         
     def forward(self,Q,K,V,mask):
@@ -99,4 +99,10 @@ class MultiHeadAttention(nn.Module):
         key = key.view(key.shape(0),query.shape(1),self.h,self.d_k).transpose(1,2) 
         value = value.view(value.shape(0),query.shape(1),self.h,self.d_k).transpose(1,2)
         x,self.attention_score = MultiHeadAttention.atten(query,key,value,mask,self.dropout)
-        return x.append()
+        return x.append() 
+
+class ResidualConnection(nn.Module):
+    def __init__(self, d_model: int, dropout: float) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = LayerNorm(d_model)    
