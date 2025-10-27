@@ -134,3 +134,28 @@ class Encoder(nn.Module):
         for layer in self.layers:
             x = layer(x,mask)
         return self.LayerNorm(x)
+    
+class DecoderBlock(nn.Module):
+    def __init__(self,AttentionBlock:MultiHeadAttention,Cross_Attention_Block:MultiHeadAttention,feed_forward_block:FeedForward,d_model:int,dropout:float) -> None:
+        super().__init__()    
+        self.AttentionBlock = AttentionBlock
+        self.Cross_Attention_Block = Cross_Attention_Block
+        self.feed_forward_block = feed_forward_block
+        self.ResidualConnection = nn.ModuleList([ResidualConnection(d_model, dropout) for _ in range(3)])
+        
+    def forward(self,x,encoder_output,src_mask,tgt_mask):
+        x = self.ResidualConnection[0](x,lambda x: self.AttentionBlock(x,x,x,tgt_mask))
+        x = self.ResidualConnection[1](x,lambda x: self.Cross_Attention_Block(x,encoder_output,encoder_output,src_mask))
+        x = self.ResidualConnection[1](x,lambda x: self.feed_forward_block())
+        return x
+    
+class decoder(nn.Module):
+    def __init__(self, layers:nn.ModuleList,d_model:int) -> None:
+        super().__init__()
+        self.layers = layers
+        self.norm = LayerNorm(d_model)
+
+    def forward(self,x,encoder_output,src_mask,tgt_mask):
+        for layer in self.layers:
+            x = layer(x,encoder_output,src_mask,tgt_mask)
+        return self.LayerNorm(x)
