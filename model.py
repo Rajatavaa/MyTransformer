@@ -149,7 +149,7 @@ class DecoderBlock(nn.Module):
         x = self.ResidualConnection[1](x,lambda x: self.feed_forward_block())
         return x
     
-class decoder(nn.Module):
+class Decoder(nn.Module):
     def __init__(self, layers:nn.ModuleList,d_model:int) -> None:
         super().__init__()
         self.layers = layers
@@ -159,3 +159,36 @@ class decoder(nn.Module):
         for layer in self.layers:
             x = layer(x,encoder_output,src_mask,tgt_mask)
         return self.LayerNorm(x)
+    
+class ProjectionLayer(nn.Module): #This is the Linear layer that is used to map the embedding into the vocabulary
+    def __init__(self,d_model,vocab_size) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model,vocab_size)
+        
+    def forward(self,x):
+        return torch.log_softmax(self.proj(x),dim = -1)
+    
+class Transformer(nn.Module):
+    def __init__(self, encoder:Encoder,decoder:Decoder,src_embedding:Inputembeddings,tgt_embedding:Inputembeddings,src_position:PositionalEncoding,tgt_position:PositionalEncoding,proj_layer:ProjectionLayer) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embedding = src_embedding
+        self.tgt_embedding = tgt_embedding
+        self.src_position = src_position
+        self.tgt_position = tgt_position
+        self.proj_layer = proj_layer
+        
+    def encode(self,src,src_mask):
+        src = self.src_embedding(src)
+        src = self.src_position(src)
+        return self.encoder(src,src_mask)
+    
+    def decode(self,tgt,encoder_output,src_mask,tgt_mask):
+        tgt = self.tgt_embedding(tgt)
+        tgt = self.tgt_position(tgt)
+        return self.decoder(tgt,encoder_output,src_mask,tgt_mask)
+    
+    
+    
+     
