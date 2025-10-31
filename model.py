@@ -54,7 +54,7 @@ class LayerNorm(nn.Module):
         return self.norm(x)
 
 class FeedForward(nn.Module):
-    def __init__(self,d_model:int,d_ff:int,dropout:int):
+    def __init__(self,d_model:int,d_ff:int,dropout:float):
         super().__init__()
         self.linear_1 = nn.Linear(d_model,d_ff)
         self.linear_2 = nn.Linear(d_ff,d_model)
@@ -64,7 +64,7 @@ class FeedForward(nn.Module):
         return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
     
 class MultiHeadAttention(nn.Module):
-    def __init__(self,d_model:int,h:int,dropout:int):
+    def __init__(self,d_model:int,h:int,dropout:float):
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -189,6 +189,21 @@ class Transformer(nn.Module):
         tgt = self.tgt_position(tgt)
         return self.decoder(tgt,encoder_output,src_mask,tgt_mask)
     
+    def project(self,x):
+        return self.proj_layer(x)
+    
+def transformer_work(self,src_vocab:int,tgt_vocab:int,src_seq_len:int,tgt_seq_len:int,d_model:int=512,N:int=6,h:int=8,dropout:float = 0.1,d_ff:int = 2048)->Transformer:
+    src_embed = Inputembeddings(d_model,src_vocab)
+    tgt_embed = Inputembeddings(d_model,tgt_vocab)
+    src_pos = PositionalEncoding(d_model,src_seq_len,dropout)
+    tgt_pos = PositionalEncoding(d_model,tgt_seq_len,dropout)
+    
+    encoder_block = []
+    for _ in range(N):
+        encoder_block_attention = MultiHeadAttention(d_model,h,dropout)
+        feed_forward_block = FeedForward(d_model,d_ff,dropout)
+        encoder_block = EncoderBlock(encoder_block_attention,feed_forward_block,dropout)
+        
     
     
      
