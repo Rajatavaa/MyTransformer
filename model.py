@@ -198,12 +198,31 @@ def transformer_work(self,src_vocab:int,tgt_vocab:int,src_seq_len:int,tgt_seq_le
     src_pos = PositionalEncoding(d_model,src_seq_len,dropout)
     tgt_pos = PositionalEncoding(d_model,tgt_seq_len,dropout)
     
-    encoder_block = []
+    encoder_blocks = []
     for _ in range(N):
         encoder_block_attention = MultiHeadAttention(d_model,h,dropout)
         feed_forward_block = FeedForward(d_model,d_ff,dropout)
-        encoder_block = EncoderBlock(encoder_block_attention,feed_forward_block,dropout)
+        encoder_block = EncoderBlock(encoder_block_attention,feed_forward_block,d_model,dropout)
+        encoder_blocks.append(encoder_block)
         
+    decoder_blocks = []
+    for _ in range(N):
+        decoder_block_attention = MultiHeadAttention(d_model,h,dropout)
+        decoder_block_cross_attention = MultiHeadAttention(d_model,h,dropout)
+        feed_forward_block = FeedForward(d_model,d_ff,dropout)
+        decoder_block = DecoderBlock(decoder_block_attention,decoder_block_cross_attention,feed_forward_block,d_model,dropout)
+        decoder_blocks.append(decoder_block)
+        
+    encoder = Encoder(nn.ModuleList(encoder_blocks), d_model)
+    decoder = Decoder(nn.ModuleList(decoder_blocks),d_model)
     
+    projection_layer = ProjectionLayer(d_model,tgt_vocab)
+    Transformers = Transformer(encoder,decoder,src_embed,tgt_embed,src_pos,tgt_pos,projection_layer)
+    
+    for p in Transformers.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+            
+    return Transformers
     
      
