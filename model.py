@@ -133,7 +133,7 @@ class Encoder(nn.Module):
     def forward(self,x,mask):
         for layer in self.layers:
             x = layer(x,mask)
-        return self.LayerNorm(x)
+        return LayerNorm(x)
     
 class DecoderBlock(nn.Module):
     def __init__(self,AttentionBlock:MultiHeadAttention,Cross_Attention_Block:MultiHeadAttention,feed_forward_block:FeedForward,d_model:int,dropout:float) -> None:
@@ -158,7 +158,7 @@ class Decoder(nn.Module):
     def forward(self,x,encoder_output,src_mask,tgt_mask):
         for layer in self.layers:
             x = layer(x,encoder_output,src_mask,tgt_mask)
-        return self.LayerNorm(x)
+        return LayerNorm(x)
     
 class ProjectionLayer(nn.Module): #This is the Linear layer that is used to map the embedding into the vocabulary
     def __init__(self,d_model,vocab_size) -> None:

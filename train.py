@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 
-from datasets import Dataset
+from datasets import load_dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import WordLevelTrainer
 from pathlib import Path
+
+def get_all_sentences(ds,lang):
+    for items in ds:
+        yield items['language'][lang]
 
 def get_tokenizer_load(config,ds,lang):
     tokenizer_path = Path(config["tokenizer.json"].format(lang))
@@ -20,5 +24,10 @@ def get_tokenizer_load(config,ds,lang):
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
     return tokenizer    
-def get_all_sentences(Dataset):
+
+def get_ds(config):
+    dataset = load_dataset('csebuetnlp/BanglaNMT',f'{config['lang_src']}-{config['lang_tgt']}',split='train')
+    
+    tokenizer_src = get_tokenizer_load(config,dataset,config['lang_src'])
+    tokenizer_tgt = get_tokenizer_load(config,dataset,config['lang_tgt'])
     
