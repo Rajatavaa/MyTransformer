@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from model import transformer_work
 
 from datasets import load_dataset
 from tokenizers import Tokenizer
@@ -31,3 +32,7 @@ def get_ds(config):
     tokenizer_src = get_tokenizer_load(config,dataset,config['lang_src'])
     tokenizer_tgt = get_tokenizer_load(config,dataset,config['lang_tgt'])
     
+def get_model(config,src_vocab_len,tgt_vocab_len):
+    model = transformer_work(src_vocab_len,tgt_vocab_len,config['seq_len'],config['seq_len'],config['d_model'])
+    return model
+
