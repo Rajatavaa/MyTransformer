@@ -26,10 +26,10 @@ class PositionalEncoding(nn.Module):
         pe[:,0::2] = torch.sin(pos*div) #Only the even indices are assigned the sine values
         pe[:,1::2] = torch.cos(pos*div) #Only the odd indices are assigned the cosine values
         pe = pe.unsqueeze(0)
-        self.resgister_buffer('pe', pe) #registering the positional encoding matrix as a buffer so that it is not considered a model parameter
+        self.register_buffer('pe', pe) #registering the positional encoding matrix as a buffer so that it is not considered a model parameter
         
     def forward(self,x):
-        x = x + (self.pe[:,:x.shape[1],:]).require_grad_(False)
+        x = x + (self.pe[:,:x.shape[1],:]).requires_grad_(False)
         return self.dropout(x)
 
 """class LayerNorm(nn.Module):
