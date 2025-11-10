@@ -77,13 +77,13 @@ class MultiHeadAttention(nn.Module):
         self.w_o = nn.Linear(d_model,d_model)
         self.dropout = nn.Dropout(dropout)
     
-    @staticmethod    
+    @staticmethod
     def atten(query,key,value,mask,dropout:nn.Dropout):
-        d_k = query.view(-1)
-        attention_score = (query @ key.transpose(-2,-1))//(math.sqrt(d_k))@value
-        
+        d_k = query.shape[-1]
+        attention_score = (query @ key.transpose(-2,-1)) / math.sqrt(d_k)
+
         if mask is not None:
-            attention_score.maked_filled(mask==0,-1e9)
+            attention_score = attention_score.masked_fill(mask==0,-1e9)
         attention_score = attention_score.softmax(dim=-1)
         if dropout is not None:
             attention_score = dropout(attention_score)
@@ -95,11 +95,15 @@ class MultiHeadAttention(nn.Module):
         key = self.w_k(K)
         value = self.w_v(V)
         
-        query = query.view(query.shape(0),query.shape(1),self.h,self.d_k).transpose(1,2) 
-        key = key.view(key.shape(0),query.shape(1),self.h,self.d_k).transpose(1,2) 
-        value = value.view(value.shape(0),query.shape(1),self.h,self.d_k).transpose(1,2)
+        query = query.view(query.shape[0],query.shape[1],self.h,self.d_k).transpose(1,2)
+        key = key.view(key.shape[0],key.shape[1],self.h,self.d_k).transpose(1,2)
+        value = value.view(value.shape[0],value.shape[1],self.h,self.d_k).transpose(1,2)
         x,self.attention_score = MultiHeadAttention.atten(query,key,value,mask,self.dropout)
-        return x.append() 
+
+        # Concatenate heads: (batch, h, seq_len, d_k) -> (batch, seq_len, h, d_k) -> (batch, seq_len, d_model)
+        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+
+        return self.w_o(x) 
 
 class ResidualConnection(nn.Module):
     
@@ -121,7 +125,7 @@ class EncoderBlock(nn.Module):
         
     def forward(self,x,src_mask):
         x = self.ResidualConnection[0](x,lambda x: self.AttentionBlock(x,x,x,src_mask))
-        x = self.ResidualConnection[1](x,lambda x: self.feed_forward_block())
+        x = self.ResidualConnection[1](x,self.feed_forward_block)
         return x
     
 class Encoder(nn.Module):
@@ -133,7 +137,7 @@ class Encoder(nn.Module):
     def forward(self,x,mask):
         for layer in self.layers:
             x = layer(x,mask)
-        return LayerNorm(x)
+        return self.norm(x)
     
 class DecoderBlock(nn.Module):
     def __init__(self,AttentionBlock:MultiHeadAttention,Cross_Attention_Block:MultiHeadAttention,feed_forward_block:FeedForward,d_model:int,dropout:float) -> None:
@@ -146,7 +150,7 @@ class DecoderBlock(nn.Module):
     def forward(self,x,encoder_output,src_mask,tgt_mask):
         x = self.ResidualConnection[0](x,lambda x: self.AttentionBlock(x,x,x,tgt_mask))
         x = self.ResidualConnection[1](x,lambda x: self.Cross_Attention_Block(x,encoder_output,encoder_output,src_mask))
-        x = self.ResidualConnection[1](x,lambda x: self.feed_forward_block())
+        x = self.ResidualConnection[2](x,self.feed_forward_block)
         return x
     
 class Decoder(nn.Module):
@@ -158,7 +162,7 @@ class Decoder(nn.Module):
     def forward(self,x,encoder_output,src_mask,tgt_mask):
         for layer in self.layers:
             x = layer(x,encoder_output,src_mask,tgt_mask)
-        return LayerNorm(x)
+        return self.norm(x)
     
 class ProjectionLayer(nn.Module): #This is the Linear layer that is used to map the embedding into the vocabulary
     def __init__(self,d_model,vocab_size) -> None:
@@ -192,7 +196,7 @@ class Transformer(nn.Module):
     def project(self,x):
         return self.proj_layer(x)
     
-def transformer_work(self,src_vocab:int,tgt_vocab:int,src_seq_len:int,tgt_seq_len:int,d_model:int=512,N:int=6,h:int=8,dropout:float = 0.1,d_ff:int = 2048)->Transformer:
+def transformer_work(src_vocab:int,tgt_vocab:int,src_seq_len:int,tgt_seq_len:int,d_model:int=512,N:int=6,h:int=8,dropout:float = 0.1,d_ff:int = 2048)->Transformer:
     src_embed = Inputembeddings(d_model,src_vocab)
     tgt_embed = Inputembeddings(d_model,tgt_vocab)
     src_pos = PositionalEncoding(d_model,src_seq_len,dropout)
