@@ -234,6 +234,17 @@ def train_model(config):
 
             global_step += 1
 
+            # Save checkpoint every N batches (mid-epoch checkpointing)
+            if global_step % config['checkpoint_interval'] == 0:
+                checkpoint_filename = get_weights_file_path(config, f"checkpoint_step_{global_step}")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'global_step': global_step
+                }, checkpoint_filename)
+                print(f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}")
+
         # Run validation at the end of every epoch
         run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
 
