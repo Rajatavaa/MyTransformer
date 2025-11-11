@@ -185,7 +185,9 @@ def get_model(config,src_vocab_len,tgt_vocab_len):
 def train_model(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device{device}")
-    Path(config['model_folder']).mkdir(parents = True,exist_ok=True)
+    # Create the correct model folder that matches get_weights_file_path
+    model_folder = f"{config['datasource']}_{config['model_folder']}"
+    Path(model_folder).mkdir(parents = True,exist_ok=True)
     
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config,tokenizer_src.get_vocab_size(),tokenizer_tgt.get_vocab_size()).to(device)
