@@ -203,9 +203,11 @@ def train_model(config):
         model_filename =  get_weights_file_path(config,config['preload'])
         print(f"Preloading model{model_filename}")
         state = torch.load(model_filename)
+        model.load_state_dict(state['model_state_dict'])
         initital_epoch = state['epoch'] + 1
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
+        print(f"Resumed from epoch {initital_epoch}, global step {global_step}")
     
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'),label_smoothing=0.1).to(device) #label_smoothing allows to less overfit thus increading the accuracy and the 0.1 means taking 10% off of all the high probability tokens and distribute in others
     for epoch in range(initital_epoch, config['num_epochs']):
