@@ -202,23 +202,46 @@ def train_model(config):
     scheduler = LambdaLR(optimizer, lr_lambda=lambda step: noam_scheduler(step + 1, config['warmup_steps'], config['d_model']))
     
     #The next steps help in retreiving back the model weights if any error happens during training
-    initital_epoch = 0
+    initial_epoch = 0
     global_step = 0
+    batches_to_skip = 0
+    resume_state = None
     if config['preload']:
         model_filename =  get_weights_file_path(config,config['preload'])
         print(f"Preloading model{model_filename}")
         state = torch.load(model_filename)
         model.load_state_dict(state['model_state_dict'])
-        initital_epoch = state['epoch'] + 1
+        resume_state = state
         optimizer.load_state_dict(state['optimizer_state_dict'])
         global_step = state['global_step']
-        print(f"Resumed from epoch {initital_epoch}, global step {global_step}")
+        print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
+    
+    steps_per_epoch = len(train_dataloader)
+
+    if resume_state:
+        if steps_per_epoch > 0:
+            completed_batches = global_step % steps_per_epoch
+        else:
+            completed_batches = 0
+
+        if completed_batches == 0 and global_step != 0:
+            initial_epoch = resume_state['epoch'] + 1
+        else:
+            initial_epoch = resume_state['epoch']
+            batches_to_skip = completed_batches
+
+        if batches_to_skip:
+            print(f"Skipping the first {batches_to_skip} batches of epoch {initial_epoch:02d} to resume mid-epoch.")
+    else:
+        initial_epoch = 0
     
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'),label_smoothing=0.1).to(device) #label_smoothing allows to less overfit thus increading the accuracy and the 0.1 means taking 10% off of all the high probability tokens and distribute in others
-    for epoch in range(initital_epoch, config['num_epochs']):
+    for epoch in range(initial_epoch, config['num_epochs']):
         model.train()
         batch_iterator = tqdm(train_dataloader,desc = f"Processing epoch{epoch:02d}")
-        for batch in batch_iterator:
+        for batch_index, batch in enumerate(batch_iterator):
+            if epoch == initial_epoch and batches_to_skip and batch_index < batches_to_skip:
+                continue
             encoder_input = batch['encoder_input'].to(device).long() #(B,Seq_len)
             decoder_input = batch['decoder_input'].to(device).long() #(B,Seq_len)
             encoder_mask = batch['encoder_mask'].to(device)   #(B,1,1,Seq_len)

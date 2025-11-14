@@ -16,11 +16,24 @@ def get_config():
         "experiment_name":"runs/tmodel",
         "tokenizer_file":"tokenizer{0}.json",
         "model_basename":"t_model" ,
-        "preload":None,
+        "preload":"checkpoint_step_5000",
         "checkpoint_interval": 5000  
     }
     
 def get_weights_file_path(config, epoch: str):
+    epoch_path = Path(epoch)
+
+    # If an absolute path is provided, respect it as-is.
+    if epoch_path.is_absolute():
+        return str(epoch_path)
+
     model_folder = f"{config['datasource']}_{config['model_folder']}"
-    model_filename = f"{config['model_basename']}{epoch}.pt"
-    return str(Path('.') / model_folder / model_filename)
+
+    # Ensure the filename includes the model basename and .pt suffix
+    filename = epoch
+    if not filename.startswith(config['model_basename']):
+        filename = f"{config['model_basename']}{filename}"
+    if not filename.endswith(".pt"):
+        filename = f"{filename}.pt"
+
+    return str(Path('.') / model_folder / filename)
