@@ -7,6 +7,7 @@ def get_config():
         "d_model":512,
         "num_epochs":3,
         "lr":10e-4,
+        "warmup_steps":5000,
         "lang_src":"en",
         "lang_tgt":"bn",
         "datasource":"banglanlp_nmt",

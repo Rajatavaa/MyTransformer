@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader,Dataset,random_split
 import torchmetrics 
@@ -17,6 +18,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.trainers import WordLevelTrainer
 from pathlib import Path
+import math
 
 def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
@@ -48,6 +50,8 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
 
     return decoder_input.squeeze(0)
 
+def noam_scheduler(step,warmup_steps,d_model):
+     return d_model**(-0.5) * min(step**(-0.5), step * warmup_steps**(-1.5))
 
 def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
     model.eval()
@@ -195,6 +199,7 @@ def train_model(config):
     #Tensorboard
     writer = SummaryWriter(config['experiment_name'])
     optimizer = torch.optim.Adam(model.parameters(),lr=config['lr'],eps = 1e-9)
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda step: noam_scheduler(step + 1, config['warmup_steps'], config['d_model']))
     
     #The next steps help in retreiving back the model weights if any error happens during training
     initital_epoch = 0
@@ -235,6 +240,7 @@ def train_model(config):
 
             # Update the weights
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
