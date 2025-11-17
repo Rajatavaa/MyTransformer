@@ -195,7 +195,7 @@ def train_model(config):
     
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config,tokenizer_src.get_vocab_size(),tokenizer_tgt.get_vocab_size()).to(device)
-    torch.compile(model)
+    model = torch.compile(model)
     #Tensorboard
     writer = SummaryWriter(config['experiment_name'])
     optimizer = torch.optim.Adam(model.parameters(),lr=config['lr'],eps = 1e-9)
@@ -260,6 +260,7 @@ def train_model(config):
 
             # Backpropagate the loss
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             # Update the weights
             optimizer.step()

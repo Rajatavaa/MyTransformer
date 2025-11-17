@@ -2,12 +2,12 @@ from pathlib import Path
 
 def get_config():
     return {
-        "batch_size":10,
+        "batch_size":32,
         "seq_len":512,
         "d_model":512,
         "num_epochs":3,
-        "lr":10e-4,
-        "warmup_steps":5000,
+        "lr":1,
+        "warmup_steps":4000,
         "lang_src":"en",
         "lang_tgt":"bn",
         "datasource":"banglanlp_nmt",
@@ -16,7 +16,7 @@ def get_config():
         "experiment_name":"runs/tmodel",
         "tokenizer_file":"tokenizer{0}.json",
         "model_basename":"t_model" ,
-        "preload":"checkpoint_step_5000",
+        "preload":None,
         "checkpoint_interval": 5000  
     }
     
