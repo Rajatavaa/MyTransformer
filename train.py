@@ -186,6 +186,34 @@ def get_model(config,src_vocab_len,tgt_vocab_len):
     model = transformer_work(src_vocab_len,tgt_vocab_len,config['seq_len'],config['seq_len'],config['d_model'])
     return model
 
+def get_latest_checkpoint(config):
+    """Find the latest checkpoint file based on global_step."""
+    model_folder = f"{config['datasource']}_{config['model_folder']}"
+    checkpoint_dir = Path(model_folder)
+    
+    if not checkpoint_dir.exists():
+        return None
+    
+    latest_checkpoint = None
+    latest_step = -1
+    
+    # Look for all checkpoint files
+    for checkpoint_file in checkpoint_dir.glob("*.pt"):
+        try:
+            state = torch.load(checkpoint_file, map_location='cpu')
+            if 'global_step' in state:
+                step = state['global_step']
+                if step > latest_step:
+                    latest_step = step
+                    latest_checkpoint = checkpoint_file
+        except Exception as e:
+            print(f"Warning: Could not load {checkpoint_file}: {e}")
+            continue
+    
+    if latest_checkpoint:
+        return str(latest_checkpoint)
+    return None
+
 def train_model(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device{device}")
@@ -207,14 +235,28 @@ def train_model(config):
     batches_to_skip = 0
     resume_state = None
     if config['preload']:
-        model_filename =  get_weights_file_path(config,config['preload'])
-        print(f"Preloading model{model_filename}")
-        state = torch.load(model_filename)
-        model.load_state_dict(state['model_state_dict'])
-        resume_state = state
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        global_step = state['global_step']
-        print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
+        # If preload is True or "latest", find the latest checkpoint automatically
+        if config['preload'] == True or config['preload'] == "latest":
+            model_filename = get_latest_checkpoint(config)
+            if model_filename:
+                print(f"Auto-detected latest checkpoint: {model_filename}")
+            else:
+                print("Warning: No checkpoint found. Starting training from scratch.")
+                model_filename = None
+        else:
+            # Use the specified checkpoint
+            model_filename = get_weights_file_path(config, config['preload'])
+        
+        if model_filename and os.path.exists(model_filename):
+            print(f"Preloading model: {model_filename}")
+            state = torch.load(model_filename, map_location=device)
+            model.load_state_dict(state['model_state_dict'])
+            resume_state = state
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            global_step = state['global_step']
+            print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
+        elif model_filename:
+            print(f"Warning: Checkpoint file {model_filename} not found. Starting training from scratch.")
     
     steps_per_epoch = len(train_dataloader)
 

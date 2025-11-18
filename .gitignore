@@ -1,0 +1,5 @@
+BanglaNMT/
+banglanlp_nmt_weights/
+runs/
+__pycache__/
+*.pt

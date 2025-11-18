@@ -6,7 +6,7 @@ def get_config():
         "seq_len":512,
         "d_model":512,
         "num_epochs":3,
-        "lr":1,
+        "lr":10e-4,
         "warmup_steps":4000,
         "lang_src":"en",
         "lang_tgt":"bn",
@@ -16,8 +16,8 @@ def get_config():
         "experiment_name":"runs/tmodel",
         "tokenizer_file":"tokenizer{0}.json",
         "model_basename":"t_model" ,
-        "preload":None,
-        "checkpoint_interval": 5000  
+        "preload":"latest",  # Set to "latest" to auto-load the last checkpoint, or specify a checkpoint name
+        "checkpoint_interval": 4000  
     }
     
 def get_weights_file_path(config, epoch: str):
