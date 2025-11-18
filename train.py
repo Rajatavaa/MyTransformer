@@ -235,6 +235,14 @@ def train_model(config):
     batches_to_skip = 0
     resume_state = None
     if config['preload']:
+        model_filename =  get_weights_file_path(config,config['preload'])
+        print(f"Preloading model{model_filename}")
+        state = torch.load(model_filename)
+        model.load_state_dict(state['model_state_dict']) #type:ignore
+        resume_state = state
+        optimizer.load_state_dict(state['optimizer_state_dict'])
+        global_step = state['global_step']
+        print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
         # If preload is True or "latest", find the latest checkpoint automatically
         if config['preload'] == True or config['preload'] == "latest":
             model_filename = get_latest_checkpoint(config)
@@ -318,6 +326,7 @@ def train_model(config):
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict':scheduler.state_dict(),
                     'global_step': global_step
                 }, checkpoint_filename)
                 print(f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}")

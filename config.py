@@ -3,7 +3,7 @@ from pathlib import Path
 def get_config():
     return {
         "batch_size":32,
-        "seq_len":512,
+        "seq_len":256,
         "d_model":512,
         "num_epochs":3,
         "lr":10e-4,
@@ -16,8 +16,8 @@ def get_config():
         "experiment_name":"runs/tmodel",
         "tokenizer_file":"tokenizer{0}.json",
         "model_basename":"t_model" ,
-        "preload":"latest",  # Set to "latest" to auto-load the last checkpoint, or specify a checkpoint name
-        "checkpoint_interval": 4000  
+        "preload":"latest",
+        "checkpoint_interval": 1000  
     }
     
 def get_weights_file_path(config, epoch: str):
