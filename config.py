@@ -6,7 +6,7 @@ def get_config():
         "seq_len":256,
         "d_model":512,
         "num_epochs":3,
-        "lr":10e-4,
+        "lr":1,
         "warmup_steps":4000,
         "lang_src":"en",
         "lang_tgt":"bn",

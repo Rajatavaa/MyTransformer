@@ -340,6 +340,7 @@ def train_model(config):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'global_step': global_step
         }, model_filename)
 
