@@ -234,37 +234,27 @@ def train_model(config):
     global_step = 0
     batches_to_skip = 0
     resume_state = None
+
     if config['preload']:
-        model_filename =  get_weights_file_path(config,config['preload'])
-        print(f"Preloading model{model_filename}")
-        state = torch.load(model_filename)
-        model.load_state_dict(state['model_state_dict']) #type:ignore
-        resume_state = state
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        global_step = state['global_step']
-        print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
-        # If preload is True or "latest", find the latest checkpoint automatically
-        if config['preload'] == True or config['preload'] == "latest":
+        # Decide which file to load
+        if config['preload'] is True or config['preload'] == "latest":
+            # Auto-detect the latest checkpoint by global_step
             model_filename = get_latest_checkpoint(config)
-            if model_filename:
-                print(f"Auto-detected latest checkpoint: {model_filename}")
-            else:
-                print("Warning: No checkpoint found. Starting training from scratch.")
-                model_filename = None
         else:
-            # Use the specified checkpoint
+            # Use a specific checkpoint name, e.g. "checkpoint_step_3000" or "00"
             model_filename = get_weights_file_path(config, config['preload'])
-        
+
         if model_filename and os.path.exists(model_filename):
-            print(f"Preloading model: {model_filename}")
+            print(f"Preloading model from: {model_filename}")
             state = torch.load(model_filename, map_location=device)
-            model.load_state_dict(state['model_state_dict'])
-            resume_state = state
+            model.load_state_dict(state['model_state_dict'])  # type: ignore
             optimizer.load_state_dict(state['optimizer_state_dict'])
             global_step = state['global_step']
+            resume_state = state
             print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
-        elif model_filename:
-            print(f"Warning: Checkpoint file {model_filename} not found. Starting training from scratch.")
+        else:
+            print("Warning: No checkpoint found. Starting training from scratch.")
+
     
     steps_per_epoch = len(train_dataloader)
 
