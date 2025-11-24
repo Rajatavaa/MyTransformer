@@ -4,6 +4,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader,Dataset,random_split
 import torchmetrics 
+import random
 from model import transformer_work
 from config import get_config,get_weights_file_path
 from tqdm import tqdm
@@ -139,16 +140,26 @@ def get_tokenizer_load(config,ds,lang):
     return tokenizer    
 
 def get_ds(config):
-    # Load dataset from local JSONL files and limit to first 200k rows
+    
     ds_raw: HFDataset = load_dataset('json', data_files='BanglaNMT/train.jsonl', split='train')  # type: ignore
-
-    # Limit to first 200k rows
+    ds_raw = ds_raw.shuffle(seed=42)  # Properly shuffle the HuggingFace dataset
     original_size = len(ds_raw)
+
+    def filter_quality(example):
+        src_words = len(example[config['lang_src']].split())
+        tgt_words = len(example[config['lang_tgt']].split())
+        return src_words >= 3 and tgt_words >= 3
+
+    ds_raw = ds_raw.filter(filter_quality)
+    print(f'Dataset filtered from {original_size} to {len(ds_raw)} rows (removed samples with <3 words)')
+
     if len(ds_raw) > 200000:
-        ds_raw = ds_raw.select(range(200000))
-        print(f'Dataset limited from {original_size} to {len(ds_raw)} rows')
+        ds_raw = ds_raw.select(range(200000))  # Now selecting from shuffled, filtered data
+        print(f'Dataset limited to {len(ds_raw)} rows')
     else:
-        print(f'Dataset size: {len(ds_raw)} rows (no limiting needed)')
+        print(f'Using all {len(ds_raw)} filtered rows (no limiting needed)')
+
+
 
     tokenizer_src = get_tokenizer_load(config, ds_raw, config['lang_src'])
     tokenizer_tgt = get_tokenizer_load(config, ds_raw, config['lang_tgt'])
@@ -156,6 +167,7 @@ def get_ds(config):
     # Use the limited dataset for training
     train_ds_raw = ds_raw
     val_ds_raw: HFDataset = load_dataset('json', data_files='BanglaNMT/validation.jsonl', split='train')  # type: ignore
+
 
     print(f'Training dataset: {len(train_ds_raw)} rows')
     print(f'Validation dataset: {len(val_ds_raw)} rows')
@@ -249,6 +261,8 @@ def train_model(config):
             state = torch.load(model_filename, map_location=device)
             model.load_state_dict(state['model_state_dict'])  # type: ignore
             optimizer.load_state_dict(state['optimizer_state_dict'])
+            if 'scheduler_state_dict' in state:
+                scheduler.load_state_dict(state['scheduler_state_dict'])
             global_step = state['global_step']
             resume_state = state
             print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
@@ -275,7 +289,7 @@ def train_model(config):
     else:
         initial_epoch = 0
     
-    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'),label_smoothing=0.1).to(device) #label_smoothing allows to less overfit thus increading the accuracy and the 0.1 means taking 10% off of all the high probability tokens and distribute in others
+    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_tgt.token_to_id('[PAD]'),label_smoothing=0.1).to(device) #label_smoothing allows to less overfit thus increading the accuracy and the 0.1 means taking 10% off of all the high probability tokens and distribute in others
     for epoch in range(initial_epoch, config['num_epochs']):
         model.train()
         batch_iterator = tqdm(train_dataloader,desc = f"Processing epoch{epoch:02d}")
