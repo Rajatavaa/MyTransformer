@@ -1,17 +1,17 @@
 import torch
 import torch.nn as nn
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader,Dataset,random_split
-import torchmetrics 
+from torch.utils.data import DataLoader, Dataset, random_split
+import torchmetrics
 import random
 from model import transformer_work
-from config import get_config,get_weights_file_path
+from config import get_config, get_weights_file_path
 from tqdm import tqdm
 from warnings import filterwarnings
 
 import os
-from dataset import BilingualDataset,causal_mask
+from dataset import BilingualDataset, causal_mask
 from datasets import load_dataset
 from datasets import Dataset as HFDataset
 from tokenizers import Tokenizer
@@ -21,9 +21,12 @@ from tokenizers.trainers import WordLevelTrainer
 from pathlib import Path
 import math
 
-def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
-    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
-    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
+
+def greedy_decode(
+    model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device
+):
+    sos_idx = tokenizer_tgt.token_to_id("[SOS]")
+    eos_idx = tokenizer_tgt.token_to_id("[EOS]")
 
     # Precompute the encoder output and reuse it for every step
     encoder_output = model.encode(source, source_mask)
@@ -34,7 +37,9 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
             break
 
         # build mask for target
-        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+        decoder_mask = (
+            causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
+        )
 
         # calculate output
         out = model.decode(decoder_input, encoder_output, source_mask, decoder_mask)
@@ -43,7 +48,15 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         prob = model.project(out[:, -1])
         _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat(
-            [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device).long()], dim=1
+            [
+                decoder_input,
+                torch.empty(1, 1)
+                .type_as(source)
+                .fill_(next_word.item())
+                .to(device)
+                .long(),
+            ],
+            dim=1,
         )
 
         if next_word == eos_idx:
@@ -51,10 +64,53 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
 
     return decoder_input.squeeze(0)
 
-def noam_scheduler(step,warmup_steps,d_model):
-     return d_model**(-0.5) * min(step**(-0.5), step * warmup_steps**(-1.5))
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, warmup_steps, max_lr, t0, t_mult):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.max_lr = max_lr
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self.cosine_scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=t0, T_mult=t_mult, eta_min=max_lr * 0.01
+        )
+        self.current_step = 0
+
+    def step(self):
+        self.current_step += 1
+        if self.current_step <= self.warmup_steps:
+            warmup_factor = self.current_step / self.warmup_steps
+            for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                pg["lr"] = self.max_lr * warmup_factor
+        else:
+            self.cosine_scheduler.step()
+
+    def get_lr(self):
+        return [pg["lr"] for pg in self.optimizer.param_groups]
+
+    def state_dict(self):
+        return {
+            "current_step": self.current_step,
+            "cosine_scheduler": self.cosine_scheduler.state_dict(),
+        }
+
+    def load_state_dict(self, state_dict):
+        self.current_step = state_dict["current_step"]
+        self.cosine_scheduler.load_state_dict(state_dict["cosine_scheduler"])
+
+
+def run_validation(
+    model,
+    validation_ds,
+    tokenizer_src,
+    tokenizer_tgt,
+    max_len,
+    device,
+    print_msg,
+    global_step,
+    writer,
+    num_examples=2,
+):
     model.eval()
     count = 0
 
@@ -64,7 +120,7 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
 
     try:
         # get the console window width
-        with os.popen('stty size', 'r') as console:
+        with os.popen("stty size", "r") as console:
             _, console_width = console.read().split()
             console_width = int(console_width)
     except:
@@ -74,14 +130,21 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
     with torch.no_grad():
         for batch in validation_ds:
             count += 1
-            encoder_input = batch["encoder_input"].to(device).long() # (b, seq_len)
-            encoder_mask = batch["encoder_mask"].to(device) # (b, 1, 1, seq_len)
+            encoder_input = batch["encoder_input"].to(device).long()  # (b, seq_len)
+            encoder_mask = batch["encoder_mask"].to(device)  # (b, 1, 1, seq_len)
 
             # check that the batch size is 1
-            assert encoder_input.size(
-                0) == 1, "Batch size must be 1 for validation"
+            assert encoder_input.size(0) == 1, "Batch size must be 1 for validation"
 
-            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            model_out = greedy_decode(
+                model,
+                encoder_input,
+                encoder_mask,
+                tokenizer_src,
+                tokenizer_tgt,
+                max_len,
+                device,
+            )
 
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
@@ -90,186 +153,234 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
             source_texts.append(source_text)
             expected.append(target_text)
             predicted.append(model_out_text)
-            
+
             # Print the source, target and model output
-            print_msg('-'*console_width)
+            print_msg("-" * console_width)
             print_msg(f"{f'SOURCE: ':>12}{source_text}")
             print_msg(f"{f'TARGET: ':>12}{target_text}")
             print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
 
             if count == num_examples:
-                print_msg('-'*console_width)
+                print_msg("-" * console_width)
                 break
-    
+
     if writer:
         # Evaluate the character error rate
-        # Compute the char error rate 
+        # Compute the char error rate
         metric = torchmetrics.CharErrorRate()
         cer = metric(predicted, expected)
-        writer.add_scalar('validation cer', cer, global_step)
+        writer.add_scalar("validation cer", cer, global_step)
         writer.flush()
 
         # Compute the word error rate
         metric = torchmetrics.WordErrorRate()
         wer = metric(predicted, expected)
-        writer.add_scalar('validation wer', wer, global_step)
+        writer.add_scalar("validation wer", wer, global_step)
         writer.flush()
 
         # Compute the BLEU metric
         metric = torchmetrics.BLEUScore()
         bleu = metric(predicted, expected)
-        writer.add_scalar('validation BLEU', bleu, global_step)
+        writer.add_scalar("validation BLEU", bleu, global_step)
         writer.flush()
 
 
-def get_all_sentences(ds,lang):
+def get_all_sentences(ds, lang):
     for items in ds:
         yield items[lang]
 
-def get_tokenizer_load(config,ds,lang):
+
+def get_tokenizer_load(config, ds, lang):
     tokenizer_path = Path(config["tokenizer_file"].format(lang))
     if not Path.exists(tokenizer_path):
         # WordLevel requires a vocab dict; provide an empty dict to be populated by the trainer
-        tokenizer = Tokenizer(WordLevel({}, unk_token='[UNK]'))
+        tokenizer = Tokenizer(WordLevel({}, unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()  # type: ignore
-        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"],min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(ds,lang),trainer=trainer)
+        trainer = WordLevelTrainer(
+            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2
+        )
+        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    return tokenizer    
+    return tokenizer
+
 
 def get_ds(config):
-    
-    ds_raw: HFDataset = load_dataset('json', data_files='BanglaNMT/train.jsonl', split='train')  # type: ignore
+    ds_raw: HFDataset = load_dataset(
+        "json", data_files="BanglaNMT/train.jsonl", split="train"
+    )  # type: ignore
     ds_raw = ds_raw.shuffle(seed=42)  # Properly shuffle the HuggingFace dataset
     original_size = len(ds_raw)
 
     def filter_quality(example):
-        src_words = len(example[config['lang_src']].split())
-        tgt_words = len(example[config['lang_tgt']].split())
+        src_words = len(example[config["lang_src"]].split())
+        tgt_words = len(example[config["lang_tgt"]].split())
         return src_words >= 3 and tgt_words >= 3
 
     ds_raw = ds_raw.filter(filter_quality)
-    print(f'Dataset filtered from {original_size} to {len(ds_raw)} rows (removed samples with <3 words)')
+    print(
+        f"Dataset filtered from {original_size} to {len(ds_raw)} rows (removed samples with <3 words)"
+    )
 
-    if len(ds_raw) > 200000:
-        ds_raw = ds_raw.select(range(200000))  # Now selecting from shuffled, filtered data
-        print(f'Dataset limited to {len(ds_raw)} rows')
+    max_dataset_size = config.get("max_dataset_size", 500000)
+    if len(ds_raw) > max_dataset_size:
+        ds_raw = ds_raw.select(range(max_dataset_size))
+        print(f"Dataset limited to {len(ds_raw)} rows")
     else:
-        print(f'Using all {len(ds_raw)} filtered rows (no limiting needed)')
+        print(f"Using all {len(ds_raw)} filtered rows (no limiting needed)")
 
-
-
-    tokenizer_src = get_tokenizer_load(config, ds_raw, config['lang_src'])
-    tokenizer_tgt = get_tokenizer_load(config, ds_raw, config['lang_tgt'])
+    tokenizer_src = get_tokenizer_load(config, ds_raw, config["lang_src"])
+    tokenizer_tgt = get_tokenizer_load(config, ds_raw, config["lang_tgt"])
 
     # Use the limited dataset for training
     train_ds_raw = ds_raw
-    val_ds_raw: HFDataset = load_dataset('json', data_files='BanglaNMT/validation.jsonl', split='train')  # type: ignore
+    val_ds_raw: HFDataset = load_dataset(
+        "json", data_files="BanglaNMT/validation.jsonl", split="train"
+    )  # type: ignore
 
+    print(f"Training dataset: {len(train_ds_raw)} rows")
+    print(f"Validation dataset: {len(val_ds_raw)} rows")
 
-    print(f'Training dataset: {len(train_ds_raw)} rows')
-    print(f'Validation dataset: {len(val_ds_raw)} rows')
-
-    train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    train_ds = BilingualDataset(
+        train_ds_raw,
+        tokenizer_src,
+        tokenizer_tgt,
+        config["lang_src"],
+        config["lang_tgt"],
+        config["seq_len"],
+    )
+    val_ds = BilingualDataset(
+        val_ds_raw,
+        tokenizer_src,
+        tokenizer_tgt,
+        config["lang_src"],
+        config["lang_tgt"],
+        config["seq_len"],
+    )
 
     # Find the maximum length of each sentence in the source and target sentence
     max_len_src = 0
     max_len_tgt = 0
 
     for item in ds_raw:
-        src_ids = tokenizer_src.encode(item[config['lang_src']]).ids
-        tgt_ids = tokenizer_tgt.encode(item[config['lang_tgt']]).ids
+        src_ids = tokenizer_src.encode(item[config["lang_src"]]).ids
+        tgt_ids = tokenizer_tgt.encode(item[config["lang_tgt"]]).ids
         max_len_src = max(max_len_src, len(src_ids))
         max_len_tgt = max(max_len_tgt, len(tgt_ids))
 
-    print(f'Max length of source sentence: {max_len_src}')
-    print(f'Max length of target sentence: {max_len_tgt}')
-    
+    print(f"Max length of source sentence: {max_len_src}")
+    print(f"Max length of target sentence: {max_len_tgt}")
 
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
+    train_dataloader = DataLoader(
+        train_ds, batch_size=config["batch_size"], shuffle=True
+    )
     val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
-        
-def get_model(config,src_vocab_len,tgt_vocab_len):
-    model = transformer_work(src_vocab_len,tgt_vocab_len,config['seq_len'],config['seq_len'],config['d_model'])
+
+
+def get_model(config, src_vocab_len, tgt_vocab_len):
+    model = transformer_work(
+        src_vocab_len,
+        tgt_vocab_len,
+        config["seq_len"],
+        config["seq_len"],
+        config["d_model"],
+    )
     return model
+
 
 def get_latest_checkpoint(config):
     """Find the latest checkpoint file based on global_step."""
     model_folder = f"{config['datasource']}_{config['model_folder']}"
     checkpoint_dir = Path(model_folder)
-    
+
     if not checkpoint_dir.exists():
         return None
-    
+
     latest_checkpoint = None
     latest_step = -1
-    
+
     # Look for all checkpoint files
     for checkpoint_file in checkpoint_dir.glob("*.pt"):
         try:
-            state = torch.load(checkpoint_file, map_location='cpu')
-            if 'global_step' in state:
-                step = state['global_step']
+            state = torch.load(checkpoint_file, map_location="cpu")
+            if "global_step" in state:
+                step = state["global_step"]
                 if step > latest_step:
                     latest_step = step
                     latest_checkpoint = checkpoint_file
         except Exception as e:
             print(f"Warning: Could not load {checkpoint_file}: {e}")
             continue
-    
+
     if latest_checkpoint:
         return str(latest_checkpoint)
     return None
 
+
 def train_model(config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device{device}")
-    # Create the correct model folder that matches get_weights_file_path
+    print(f"device: {device}")
     model_folder = f"{config['datasource']}_{config['model_folder']}"
-    Path(model_folder).mkdir(parents = True,exist_ok=True)
-    
+    Path(model_folder).mkdir(parents=True, exist_ok=True)
+
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
-    model = get_model(config,tokenizer_src.get_vocab_size(),tokenizer_tgt.get_vocab_size()).to(device)
-    model = torch.compile(model)
-    #Tensorboard
-    writer = SummaryWriter(config['experiment_name'])
-    optimizer = torch.optim.Adam(model.parameters(),lr=config['lr'],eps = 1e-9)
-    scheduler = LambdaLR(optimizer, lr_lambda=lambda step: noam_scheduler(step + 1, config['warmup_steps'], config['d_model']))
-    
-    #The next steps help in retreiving back the model weights if any error happens during training
+    model = get_model(
+        config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()
+    ).to(device)
+
+    writer = SummaryWriter(config["experiment_name"])
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-7)
+
+    gradient_accumulation = config.get("gradient_accumulation", 4)
+    warmup_steps = config["warmup_steps"]
+    max_lr = config["lr"]
+    t0 = config.get("scheduler_t0", 5000)
+    t_mult = config.get("scheduler_t_mult", 2)
+
+    scheduler = WarmupCosineScheduler(
+        optimizer,
+        warmup_steps=warmup_steps,
+        max_lr=max_lr,
+        t0=t0,
+        t_mult=t_mult,
+    )
+
     initial_epoch = 0
     global_step = 0
     batches_to_skip = 0
     resume_state = None
+    best_val_loss = float("inf")
 
-    if config['preload']:
-        # Decide which file to load
-        if config['preload'] is True or config['preload'] == "latest":
-            # Auto-detect the latest checkpoint by global_step
+    if config["preload"]:
+        if config["preload"] is True or config["preload"] == "latest":
             model_filename = get_latest_checkpoint(config)
         else:
-            # Use a specific checkpoint name, e.g. "checkpoint_step_3000" or "00"
-            model_filename = get_weights_file_path(config, config['preload'])
+            model_filename = get_weights_file_path(config, config["preload"])
 
         if model_filename and os.path.exists(model_filename):
             print(f"Preloading model from: {model_filename}")
             state = torch.load(model_filename, map_location=device)
-            model.load_state_dict(state['model_state_dict'])  # type: ignore
-            optimizer.load_state_dict(state['optimizer_state_dict'])
-            if 'scheduler_state_dict' in state:
-                scheduler.load_state_dict(state['scheduler_state_dict'])
-            global_step = state['global_step']
+            state_dict = state["model_state_dict"]
+            if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+                print("Removing '_orig_mod.' prefix from torch.compile() checkpoint...")
+                state_dict = {
+                    k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
+                }
+            model.load_state_dict(state_dict)
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if "scheduler_state_dict" in state:
+                scheduler.load_state_dict(state["scheduler_state_dict"])
+            global_step = state["global_step"]
             resume_state = state
+            if "best_val_loss" in state:
+                best_val_loss = state["best_val_loss"]
             print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
         else:
             print("Warning: No checkpoint found. Starting training from scratch.")
 
-    
     steps_per_epoch = len(train_dataloader)
 
     if resume_state:
@@ -279,81 +390,152 @@ def train_model(config):
             completed_batches = 0
 
         if completed_batches == 0 and global_step != 0:
-            initial_epoch = resume_state['epoch'] + 1
+            initial_epoch = resume_state["epoch"] + 1
         else:
-            initial_epoch = resume_state['epoch']
+            initial_epoch = resume_state["epoch"]
             batches_to_skip = completed_batches
 
         if batches_to_skip:
-            print(f"Skipping the first {batches_to_skip} batches of epoch {initial_epoch:02d} to resume mid-epoch.")
+            print(
+                f"Skipping the first {batches_to_skip} batches of epoch {initial_epoch:02d} to resume mid-epoch."
+            )
     else:
         initial_epoch = 0
-    
-    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_tgt.token_to_id('[PAD]'),label_smoothing=0.1).to(device) #label_smoothing allows to less overfit thus increading the accuracy and the 0.1 means taking 10% off of all the high probability tokens and distribute in others
-    for epoch in range(initial_epoch, config['num_epochs']):
+
+    loss_fn = nn.CrossEntropyLoss(
+        ignore_index=tokenizer_tgt.token_to_id("[PAD]"), label_smoothing=0.1
+    ).to(device)
+
+    accumulation_counter = 0
+
+    for epoch in range(initial_epoch, config["num_epochs"]):
         model.train()
-        batch_iterator = tqdm(train_dataloader,desc = f"Processing epoch{epoch:02d}")
+        batch_iterator = tqdm(train_dataloader, desc=f"Processing epoch {epoch:02d}")
+        epoch_loss = 0.0
+        num_batches = 0
+
         for batch_index, batch in enumerate(batch_iterator):
-            if epoch == initial_epoch and batches_to_skip and batch_index < batches_to_skip:
+            if (
+                epoch == initial_epoch
+                and batches_to_skip
+                and batch_index < batches_to_skip
+            ):
                 continue
-            encoder_input = batch['encoder_input'].to(device).long() #(B,Seq_len)
-            decoder_input = batch['decoder_input'].to(device).long() #(B,Seq_len)
-            encoder_mask = batch['encoder_mask'].to(device)   #(B,1,1,Seq_len)
-            decoder_mask = batch['decoder_mask'].to(device)   #(B,1,Seq_len,Seq_len)
 
-            encoder_output = model.encode(encoder_input,encoder_mask) #(B,seq_len,d_model)
-            decoder_output = model.decode(decoder_input,encoder_output,encoder_mask,decoder_mask) #(B,seq_len,d_model)
-            proj_output = model.project(decoder_output) #(B,seq_len,vocab_size)
-            label = batch['label'].to(device).long()
-            loss = loss_fn(proj_output.view(-1,tokenizer_tgt.get_vocab_size()),label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
+            encoder_input = batch["encoder_input"].to(device).long()
+            decoder_input = batch["decoder_input"].to(device).long()
+            encoder_mask = batch["encoder_mask"].to(device)
+            decoder_mask = batch["decoder_mask"].to(device)
 
-            # Log the loss
-            writer.add_scalar('train loss', loss.item(), global_step)
+            encoder_output = model.encode(encoder_input, encoder_mask)
+            decoder_output = model.decode(
+                decoder_input, encoder_output, encoder_mask, decoder_mask
+            )
+            proj_output = model.project(decoder_output)
+            label = batch["label"].to(device).long()
+            loss = loss_fn(
+                proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1)
+            )
+            scaled_loss = loss / gradient_accumulation
+            scaled_loss.backward()
+
+            epoch_loss += loss.item()
+            num_batches += 1
+            accumulation_counter += 1
+
+            batch_iterator.set_postfix(
+                {"loss": f"{loss.item():6.3f}", "lr": f"{scheduler.get_lr()[0]:.2e}"}
+            )
+
+            writer.add_scalar("train loss", loss.item(), global_step)
+            writer.add_scalar("learning rate", scheduler.get_lr()[0], global_step)
             writer.flush()
 
-            # Backpropagate the loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            # Update the weights
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            if accumulation_counter % gradient_accumulation == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
 
-            # Save checkpoint every N batches (mid-epoch checkpointing)
-            if global_step % config['checkpoint_interval'] == 0:
-                checkpoint_filename = get_weights_file_path(config, f"checkpoint_step_{global_step}")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict':scheduler.state_dict(),
-                    'global_step': global_step
-                }, checkpoint_filename)
-                print(f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}")
+            if global_step % config["checkpoint_interval"] == 0:
+                checkpoint_filename = get_weights_file_path(
+                    config, f"checkpoint_step_{global_step}"
+                )
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict(),
+                        "global_step": global_step,
+                        "best_val_loss": best_val_loss,
+                    },
+                    checkpoint_filename,
+                )
+                print(
+                    f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}"
+                )
+
+        # Handle any remaining accumulated gradients at end of epoch
+        if accumulation_counter % gradient_accumulation != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+            accumulation_counter = 0
+
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        print(f"\nEpoch {epoch:02d} average loss: {avg_epoch_loss:.4f}")
 
         # Run validation at the end of every epoch
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        run_validation(
+            model,
+            val_dataloader,
+            tokenizer_src,
+            tokenizer_tgt,
+            config["seq_len"],
+            device,
+            lambda msg: batch_iterator.write(msg),
+            global_step,
+            writer,
+        )
+
+        writer.add_scalar("epoch avg loss", avg_epoch_loss, epoch)
 
         # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'global_step': global_step
-        }, model_filename)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "global_step": global_step,
+                "best_val_loss": best_val_loss,
+            },
+            model_filename,
+        )
+
+        # Best-model checkpointing based on epoch average loss
+        if avg_epoch_loss < best_val_loss:
+            best_val_loss = avg_epoch_loss
+            best_filename = get_weights_file_path(config, "best")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "global_step": global_step,
+                    "best_val_loss": best_val_loss,
+                },
+                best_filename,
+            )
+            print(f"New best model saved (loss: {best_val_loss:.4f}): {best_filename}")
 
 
-if __name__ == '__main__':
-    
+if __name__ == "__main__":
     config = get_config()
     train_model(config)
-            
-            
-            
-            
