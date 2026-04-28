@@ -14,7 +14,14 @@ from dataset import BilingualDataset, causal_mask
 
 
 def greedy_decode(
-    model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device
+    model,
+    source,
+    source_mask,
+    tokenizer_src,
+    tokenizer_tgt,
+    max_len,
+    device,
+    repetition_penalty: float = 1.2,
 ):
     """Greedy decoding for translation."""
     sos_idx = tokenizer_tgt.token_to_id("[SOS]")
@@ -27,20 +34,17 @@ def greedy_decode(
         if decoder_input.size(1) == max_len:
             break
 
-        decoder_mask = (
-            causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
-        )
+        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
         out = model.decode(decoder_input, encoder_output, source_mask, decoder_mask)
         prob = model.project(out[:, -1])
+        if decoder_input.size(1) > 1:
+            for token_id in decoder_input[:, 1:].unique().tolist():
+                prob[:, token_id] -= repetition_penalty
         _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat(
             [
                 decoder_input,
-                torch.empty(1, 1)
-                .type_as(source)
-                .fill_(next_word.item())
-                .to(device)
-                .long(),
+                torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device).long(),
             ],
             dim=1,
         )
@@ -67,9 +71,7 @@ def load_tokenizers(config):
     return tokenizer_src, tokenizer_tgt
 
 
-def load_model_from_checkpoint(
-    checkpoint_path, config, tokenizer_src, tokenizer_tgt, device
-):
+def load_model_from_checkpoint(checkpoint_path, config, tokenizer_src, tokenizer_tgt, device):
     """Load model from a checkpoint file."""
     model = transformer_work(
         tokenizer_src.get_vocab_size(),
@@ -268,9 +270,7 @@ def interactive_mode(model, tokenizer_src, tokenizer_tgt, config, device):
     """Interactive translation mode."""
     print("\n" + "=" * 60)
     print("INTERACTIVE TRANSLATION MODE")
-    print(
-        f"Translating from {config['lang_src'].upper()} to {config['lang_tgt'].upper()}"
-    )
+    print(f"Translating from {config['lang_src'].upper()} to {config['lang_tgt'].upper()}")
     print("Type 'quit' or 'exit' to stop")
     print("=" * 60 + "\n")
 

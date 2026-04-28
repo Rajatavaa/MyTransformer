@@ -1,5 +1,7 @@
+import os
 import torch
 import torch.nn as nn
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset, random_split
@@ -10,7 +12,6 @@ from config import get_config, get_weights_file_path
 from tqdm import tqdm
 from warnings import filterwarnings
 
-import os
 from dataset import BilingualDataset, causal_mask
 from datasets import load_dataset
 from datasets import Dataset as HFDataset
@@ -23,7 +24,14 @@ import math
 
 
 def greedy_decode(
-    model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device
+    model,
+    source,
+    source_mask,
+    tokenizer_src,
+    tokenizer_tgt,
+    max_len,
+    device,
+    repetition_penalty: float = 1.2,
 ):
     sos_idx = tokenizer_tgt.token_to_id("[SOS]")
     eos_idx = tokenizer_tgt.token_to_id("[EOS]")
@@ -37,24 +45,21 @@ def greedy_decode(
             break
 
         # build mask for target
-        decoder_mask = (
-            causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
-        )
+        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
 
         # calculate output
         out = model.decode(decoder_input, encoder_output, source_mask, decoder_mask)
 
         # get next token
         prob = model.project(out[:, -1])
+        if decoder_input.size(1) > 1:
+            for token_id in decoder_input[:, 1:].unique().tolist():
+                prob[:, token_id] -= repetition_penalty
         _, next_word = torch.max(prob, dim=1)
         decoder_input = torch.cat(
             [
                 decoder_input,
-                torch.empty(1, 1)
-                .type_as(source)
-                .fill_(next_word.item())
-                .to(device)
-                .long(),
+                torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device).long(),
             ],
             dim=1,
         )
@@ -207,9 +212,7 @@ def get_tokenizer_load(config, ds, lang):
 
 
 def get_ds(config):
-    ds_raw: HFDataset = load_dataset(
-        "json", data_files="BanglaNMT/train.jsonl", split="train"
-    )  # type: ignore
+    ds_raw: HFDataset = load_dataset("json", data_files="BanglaNMT/train.jsonl", split="train")  # type: ignore
     ds_raw = ds_raw.shuffle(seed=42)  # Properly shuffle the HuggingFace dataset
     original_size = len(ds_raw)
 
@@ -272,9 +275,7 @@ def get_ds(config):
     print(f"Max length of source sentence: {max_len_src}")
     print(f"Max length of target sentence: {max_len_tgt}")
 
-    train_dataloader = DataLoader(
-        train_ds, batch_size=config["batch_size"], shuffle=True
-    )
+    train_dataloader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True)
     val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
@@ -327,12 +328,13 @@ def train_model(config):
     Path(model_folder).mkdir(parents=True, exist_ok=True)
 
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
-    model = get_model(
-        config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()
-    ).to(device)
+    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(
+        device
+    )
 
     writer = SummaryWriter(config["experiment_name"])
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-7)
+    scaler = GradScaler("cuda")
 
     gradient_accumulation = config.get("gradient_accumulation", 4)
     warmup_steps = config["warmup_steps"]
@@ -366,13 +368,13 @@ def train_model(config):
             state_dict = state["model_state_dict"]
             if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
                 print("Removing '_orig_mod.' prefix from torch.compile() checkpoint...")
-                state_dict = {
-                    k.replace("_orig_mod.", ""): v for k, v in state_dict.items()
-                }
+                state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
             model.load_state_dict(state_dict)
             optimizer.load_state_dict(state["optimizer_state_dict"])
             if "scheduler_state_dict" in state:
                 scheduler.load_state_dict(state["scheduler_state_dict"])
+            if "scaler_state_dict" in state:
+                scaler.load_state_dict(state["scaler_state_dict"])
             global_step = state["global_step"]
             resume_state = state
             if "best_val_loss" in state:
@@ -415,11 +417,7 @@ def train_model(config):
         num_batches = 0
 
         for batch_index, batch in enumerate(batch_iterator):
-            if (
-                epoch == initial_epoch
-                and batches_to_skip
-                and batch_index < batches_to_skip
-            ):
+            if epoch == initial_epoch and batches_to_skip and batch_index < batches_to_skip:
                 continue
 
             encoder_input = batch["encoder_input"].to(device).long()
@@ -427,17 +425,21 @@ def train_model(config):
             encoder_mask = batch["encoder_mask"].to(device)
             decoder_mask = batch["decoder_mask"].to(device)
 
-            encoder_output = model.encode(encoder_input, encoder_mask)
-            decoder_output = model.decode(
-                decoder_input, encoder_output, encoder_mask, decoder_mask
-            )
-            proj_output = model.project(decoder_output)
-            label = batch["label"].to(device).long()
-            loss = loss_fn(
-                proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1)
-            )
+            with autocast("cuda"):
+                encoder_output = model.encode(encoder_input, encoder_mask)
+                decoder_output = model.decode(
+                    decoder_input, encoder_output, encoder_mask, decoder_mask
+                )
+                proj_output = model.project(decoder_output)
+                label = batch["label"].to(device).long()
+                loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             scaled_loss = loss / gradient_accumulation
-            scaled_loss.backward()
+            scaler.scale(scaled_loss).backward()
 
             epoch_loss += loss.item()
             num_batches += 1
@@ -452,8 +454,10 @@ def train_model(config):
             writer.flush()
 
             if accumulation_counter % gradient_accumulation == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -469,19 +473,20 @@ def train_model(config):
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
                         "global_step": global_step,
                         "best_val_loss": best_val_loss,
                     },
                     checkpoint_filename,
                 )
-                print(
-                    f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}"
-                )
+                print(f"\nCheckpoint saved at step {global_step}: {checkpoint_filename}")
 
         # Handle any remaining accumulated gradients at end of epoch
         if accumulation_counter % gradient_accumulation != 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             accumulation_counter = 0
@@ -512,6 +517,7 @@ def train_model(config):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "global_step": global_step,
                 "best_val_loss": best_val_loss,
             },
@@ -528,6 +534,7 @@ def train_model(config):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "global_step": global_step,
                     "best_val_loss": best_val_loss,
                 },

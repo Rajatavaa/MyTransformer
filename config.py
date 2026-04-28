@@ -3,7 +3,7 @@ from pathlib import Path
 
 def get_config():
     return {
-        "batch_size": 32,
+        "batch_size": 8,
         "seq_len": 256,
         "d_model": 512,
         "num_epochs": 20,
@@ -11,7 +11,7 @@ def get_config():
         "warmup_steps": 2000,
         "scheduler_t0": 5000,
         "scheduler_t_mult": 2,
-        "gradient_accumulation": 4,
+        "gradient_accumulation": 16,
         "lang_src": "en",
         "lang_tgt": "bn",
         "datasource": "banglanlp_nmt",
@@ -21,7 +21,7 @@ def get_config():
         "tokenizer_file": "tokenizer{0}.json",
         "model_basename": "t_model",
         "preload": "latest",
-        "checkpoint_interval": 1000,
+        "checkpoint_interval": 5000,
         "max_dataset_size": 500000,
     }
 
