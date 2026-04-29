@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset, random_split
 import torchmetrics
@@ -71,37 +71,40 @@ def greedy_decode(
 
 
 class WarmupCosineScheduler:
-    def __init__(self, optimizer, warmup_steps, max_lr, t0, t_mult):
+    def __init__(self, optimizer, warmup_steps, max_lr, total_steps, current_step=0):
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self.max_lr = max_lr
-        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self.cosine_scheduler = CosineAnnealingWarmRestarts(
-            optimizer, T_0=t0, T_mult=t_mult, eta_min=max_lr * 0.01
-        )
-        self.current_step = 0
+        self.min_lr = max_lr * 0.01
+        self.total_steps = total_steps
+        self.current_step = current_step
+
+    def _update_lr(self):
+        if self.current_step < self.warmup_steps:
+            lr = self.max_lr * (self.current_step / max(1, self.warmup_steps))
+        else:
+            progress = (self.current_step - self.warmup_steps) / max(
+                1, self.total_steps - self.warmup_steps
+            )
+            lr = self.min_lr + (self.max_lr - self.min_lr) * 0.5 * (
+                1 + math.cos(math.pi * progress)
+            )
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
 
     def step(self):
         self.current_step += 1
-        if self.current_step <= self.warmup_steps:
-            warmup_factor = self.current_step / self.warmup_steps
-            for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-                pg["lr"] = self.max_lr * warmup_factor
-        else:
-            self.cosine_scheduler.step()
+        self._update_lr()
 
     def get_lr(self):
         return [pg["lr"] for pg in self.optimizer.param_groups]
 
     def state_dict(self):
-        return {
-            "current_step": self.current_step,
-            "cosine_scheduler": self.cosine_scheduler.state_dict(),
-        }
+        return {"current_step": self.current_step}
 
     def load_state_dict(self, state_dict):
         self.current_step = state_dict["current_step"]
-        self.cosine_scheduler.load_state_dict(state_dict["cosine_scheduler"])
+        self._update_lr()
 
 
 def run_validation(
@@ -339,15 +342,14 @@ def train_model(config):
     gradient_accumulation = config.get("gradient_accumulation", 4)
     warmup_steps = config["warmup_steps"]
     max_lr = config["lr"]
-    t0 = config.get("scheduler_t0", 5000)
-    t_mult = config.get("scheduler_t_mult", 2)
+    total_training_steps = config.get("total_training_steps", 400000)
 
     scheduler = WarmupCosineScheduler(
         optimizer,
         warmup_steps=warmup_steps,
         max_lr=max_lr,
-        t0=t0,
-        t_mult=t_mult,
+        total_steps=total_training_steps,
+        current_step=0,
     )
 
     initial_epoch = 0
@@ -371,14 +373,15 @@ def train_model(config):
                 state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
             model.load_state_dict(state_dict)
             optimizer.load_state_dict(state["optimizer_state_dict"])
-            if "scheduler_state_dict" in state:
-                scheduler.load_state_dict(state["scheduler_state_dict"])
+            # Ignore old scheduler state; reinitialize schedule at current global_step
             if "scaler_state_dict" in state:
                 scaler.load_state_dict(state["scaler_state_dict"])
             global_step = state["global_step"]
             resume_state = state
             if "best_val_loss" in state:
                 best_val_loss = state["best_val_loss"]
+            scheduler.current_step = global_step
+            scheduler._update_lr()
             print(f"Resumed from epoch {state['epoch']}, global step {global_step}")
         else:
             print("Warning: No checkpoint found. Starting training from scratch.")
