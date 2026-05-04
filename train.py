@@ -15,10 +15,10 @@ from warnings import filterwarnings
 from dataset import BilingualDataset, causal_mask
 from datasets import load_dataset
 from datasets import Dataset as HFDataset
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.models import BPE
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-from tokenizers.trainers import WordLevelTrainer
 from pathlib import Path
 import math
 
@@ -202,10 +202,10 @@ def get_tokenizer_load(config, ds, lang):
     tokenizer_path = Path(config["tokenizer_file"].format(lang))
     if not Path.exists(tokenizer_path):
         # WordLevel requires a vocab dict; provide an empty dict to be populated by the trainer
-        tokenizer = Tokenizer(WordLevel({}, unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()  # type: ignore
-        trainer = WordLevelTrainer(
-            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2
+        tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        trainer = BpeTrainer(
+            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2,vocab_size=30000
         )
         tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
@@ -334,6 +334,7 @@ def train_model(config):
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(
         device
     )
+    model = torch.compile(model)
 
     writer = SummaryWriter(config["experiment_name"])
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-7)
@@ -368,9 +369,15 @@ def train_model(config):
             print(f"Preloading model from: {model_filename}")
             state = torch.load(model_filename, map_location=device)
             state_dict = state["model_state_dict"]
-            if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-                print("Removing '_orig_mod.' prefix from torch.compile() checkpoint...")
+            ckpt_has_prefix = any(k.startswith("_orig_mod.") for k in state_dict.keys())
+            model_expects_prefix = next(iter(model.state_dict().keys())).startswith("_orig_mod.")
+
+            if ckpt_has_prefix and not model_expects_prefix:
+                print("Removing '_orig_mod.' prefix from compiled checkpoint...")
                 state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+            elif not ckpt_has_prefix and model_expects_prefix:
+                print("Adding '_orig_mod.' prefix for torch.compile()...")
+                state_dict = {"_orig_mod." + k: v for k, v in state_dict.items()}
             model.load_state_dict(state_dict)
             optimizer.load_state_dict(state["optimizer_state_dict"])
             # Ignore old scheduler state; reinitialize schedule at current global_step

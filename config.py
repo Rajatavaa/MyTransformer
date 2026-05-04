@@ -20,7 +20,7 @@ def get_config():
         "tokenizer_file": "tokenizer{0}.json",
         "model_basename": "t_model",
         "preload": "latest",
-        "checkpoint_interval": 5000,
+        "checkpoint_interval": 10000,
         "max_dataset_size": 500000,
     }
 
