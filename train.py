@@ -17,6 +17,7 @@ from datasets import load_dataset
 from datasets import Dataset as HFDataset
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers import Tokenizer
 from pathlib import Path
@@ -205,12 +206,14 @@ def get_tokenizer_load(config, ds, lang):
         tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
         trainer = BpeTrainer(
-            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2,vocab_size=30000
+            special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2, vocab_size=30000
         )
         tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
+        tokenizer.decoder = ByteLevelDecoder()
         tokenizer.save(str(tokenizer_path))
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        tokenizer.decoder = ByteLevelDecoder()
     return tokenizer
 
 

@@ -1,78 +1,376 @@
-import torch
+import math
 import argparse
+import unicodedata
+from collections import Counter
 from pathlib import Path
+
+import torch
 from tokenizers import Tokenizer
-from datasets import load_dataset
-from datasets import Dataset as HFDataset
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+from datasets import load_dataset, Dataset as HFDataset
 from torch.utils.data import DataLoader
-import torchmetrics
 from tqdm import tqdm
+from torchmetrics.text import CharErrorRate, WordErrorRate
 
 from model import transformer_work
 from config import get_config, get_weights_file_path
 from dataset import BilingualDataset, causal_mask
 
 
-def greedy_decode(
-    model,
-    source,
-    source_mask,
-    tokenizer_src,
-    tokenizer_tgt,
-    max_len,
-    device,
-    repetition_penalty: float = 1.2,
-):
-    """Greedy decoding for translation."""
+# =========================
+
+# TEXT UTILITIES
+
+# =========================
+
+
+def normalize_text(text):
+    text = text.encode("utf-8", errors="ignore").decode("utf-8")
+    text = text.replace("\u0120", " ")
+    text = text.replace("\u200d", "")
+    text = text.replace("\u200c", "")
+    text = text.replace("\u200b", "")
+    text = "".join(
+        ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf") or ch in ("\n", "\t")
+    )
+    text = unicodedata.normalize("NFKC", text)
+    text = " ".join(text.split())
+    return text.strip()
+
+
+def tokenize_bengali(text):
+    return text.split()
+
+
+# =========================
+
+# BLEU METRICS
+
+# =========================
+
+
+def _count_ngrams(tokens, max_n):
+    ngram_counts = Counter()
+    for n in range(1, max_n + 1):
+        for i in range(len(tokens) - n + 1):
+            ngram_counts[tuple(tokens[i : i + n])] += 1
+    return ngram_counts
+
+
+def corpus_bleu(preds, refs, max_n=4):
+    total_clip = [0] * max_n
+    total_count = [0] * max_n
+    ref_len_total = 0
+    pred_len_total = 0
+
+    for pred, ref_list in zip(preds, refs):
+        pred_tokens = pred.split()
+        ref_token_lists = [r.split() for r in ref_list]
+        ref_lens = [len(rt) for rt in ref_token_lists]
+
+        closest_idx = min(range(len(ref_lens)), key=lambda i: abs(ref_lens[i] - len(pred_tokens)))
+        ref_len_total += ref_lens[closest_idx]
+        pred_len_total += len(pred_tokens)
+
+        pred_ngrams = _count_ngrams(pred_tokens, max_n)
+        max_ref_ngrams = Counter()
+        for ref_tokens in ref_token_lists:
+            ref_ngrams = _count_ngrams(ref_tokens, max_n)
+            for ngram, count in ref_ngrams.items():
+                max_ref_ngrams[ngram] = max(max_ref_ngrams.get(ngram, 0), count)
+
+        for ngram, count in pred_ngrams.items():
+            n = len(ngram) - 1
+            if n < max_n:
+                total_clip[n] += min(count, max_ref_ngrams.get(ngram, 0))
+                total_count[n] += count
+
+    if pred_len_total == 0:
+        return 0.0
+
+    if pred_len_total < ref_len_total:
+        bp = math.exp(1 - ref_len_total / pred_len_total)
+    else:
+        bp = 1.0
+
+    log_avg = 0.0
+    for n in range(max_n):
+        if total_count[n] == 0:
+            return 0.0
+        precision = (total_clip[n] + 1) / (total_count[n] + 1)
+        log_avg += math.log(precision)
+    log_avg /= max_n
+
+    return bp * math.exp(log_avg) * 100
+
+
+def _get_char_ngrams(text, min_n=3, max_n=6):
+    words = text.split()
+    ngrams = []
+    for word in words:
+        chars = list(word)
+        for n in range(min_n, max_n + 1):
+            for i in range(len(chars) - n + 1):
+                ngrams.append(tuple(chars[i : i + n]))
+    return ngrams
+
+
+def char_bleu(preds, refs, min_n=3, max_n=6):
+    num_levels = max_n - min_n + 1
+    total_clip = [0] * num_levels
+    total_count = [0] * num_levels
+    ref_len_total = 0
+    pred_len_total = 0
+
+    for pred, ref_list in zip(preds, refs):
+        pred_char_lens = sum(len(w) for w in pred.split())
+        pred_len_total += pred_char_lens
+
+        best_clip = [Counter() for _ in range(num_levels)]
+        best_count = [Counter() for _ in range(num_levels)]
+
+        best_ref_len = float("inf")
+        for ref in ref_list:
+            ref_char_lens = sum(len(w) for w in ref.split())
+            if abs(ref_char_lens - pred_char_lens) < abs(best_ref_len - pred_char_lens):
+                best_ref_len = ref_char_lens
+
+            ref_ngrams = Counter(_get_char_ngrams(ref, min_n, max_n))
+            pred_ngrams = Counter(_get_char_ngrams(pred, min_n, max_n))
+            clipped = pred_ngrams & ref_ngrams
+
+            for ngram, count in clipped.items():
+                idx = len(ngram) - min_n
+                if 0 <= idx < num_levels:
+                    best_clip[idx][ngram] = max(best_clip[idx].get(ngram, 0), count)
+
+            for ngram, count in pred_ngrams.items():
+                idx = len(ngram) - min_n
+                if 0 <= idx < num_levels:
+                    best_count[idx][ngram] = max(best_count[idx].get(ngram, 0), count)
+
+        ref_len_total += best_ref_len
+
+        for idx in range(num_levels):
+            total_clip[idx] += sum(best_clip[idx].values())
+            total_count[idx] += sum(best_count[idx].values())
+
+    if pred_len_total == 0:
+        return 0.0
+
+    if pred_len_total < ref_len_total:
+        bp = math.exp(1 - ref_len_total / pred_len_total)
+    else:
+        bp = 1.0
+
+    if any(c == 0 for c in total_count):
+        return 0.0
+
+    log_avg = 0.0
+    for idx in range(num_levels):
+        precision = (total_clip[idx] + 1) / (total_count[idx] + 1)
+        log_avg += math.log(precision)
+    log_avg /= num_levels
+
+    return bp * math.exp(log_avg) * 100
+
+
+# =========================
+
+# GREEDY DECODING
+
+# =========================
+
+
+def greedy_decode(model, source, source_mask, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id("[SOS]")
     eos_idx = tokenizer_tgt.token_to_id("[EOS]")
 
     encoder_output = model.encode(source, source_mask)
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device).long()
+    decoder_input = torch.tensor([[sos_idx]], dtype=torch.long).to(device)
 
-    while True:
-        if decoder_input.size(1) == max_len:
-            break
+    while decoder_input.size(1) < max_len:
+        decoder_mask = causal_mask(decoder_input.size(1)).to(device)
 
-        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
         out = model.decode(decoder_input, encoder_output, source_mask, decoder_mask)
-        prob = model.project(out[:, -1])
-        if decoder_input.size(1) > 1:
-            for token_id in decoder_input[:, 1:].unique().tolist():
-                prob[:, token_id] -= repetition_penalty
-        _, next_word = torch.max(prob, dim=1)
-        decoder_input = torch.cat(
-            [
-                decoder_input,
-                torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device).long(),
-            ],
-            dim=1,
-        )
+        logits = model.project(out[:, -1])
 
-        if next_word == eos_idx:
+        probs = torch.softmax(logits, dim=-1)
+        next_word = torch.argmax(probs, dim=-1)
+
+        decoder_input = torch.cat([decoder_input, next_word.unsqueeze(0)], dim=1)
+
+        if next_word.item() == eos_idx:
             break
 
     return decoder_input.squeeze(0)
 
 
+# =========================
+
+# BEAM SEARCH
+
+# =========================
+
+
+def length_penalty(seq_len, alpha=0.6):
+    return ((5 + seq_len) / (5 + 1)) ** alpha
+
+
+def get_blocked_tokens(tokens, n=3):
+    if len(tokens) < n:
+        return set()
+
+    seen = {}
+    blocked = set()
+
+    for i in range(len(tokens) - n + 1):
+        ngram = tuple(tokens[i : i + n - 1])
+        next_token = tokens[i + n - 1]
+
+        if ngram in seen:
+            blocked.add(next_token)
+        seen[ngram] = True
+
+    return blocked
+
+
+def beam_search_decode(
+    model,
+    source,
+    source_mask,
+    tokenizer_tgt,
+    max_len,
+    device,
+    beam_size=5,
+    alpha=0.6,
+    ngram_block=3,
+):
+    sos_idx = tokenizer_tgt.token_to_id("[SOS]")
+    eos_idx = tokenizer_tgt.token_to_id("[EOS]")
+    pad_idx = tokenizer_tgt.token_to_id("[PAD]")
+
+    encoder_output = model.encode(source, source_mask)
+
+    beams = [
+        {
+            "tokens": [sos_idx],
+            "logp": 0.0,
+            "finished": False,
+        }
+    ]
+
+    for _ in range(max_len - 1):
+        all_candidates = []
+
+        for beam in beams:
+            if beam["finished"]:
+                all_candidates.append(beam)
+                continue
+
+            seq_len = len(beam["tokens"])
+            decoder_input = torch.tensor([beam["tokens"]], dtype=torch.long).to(device)
+            decoder_mask = causal_mask(seq_len).to(device)
+
+            out = model.decode(decoder_input, encoder_output, source_mask, decoder_mask)
+            logits = model.project(out[:, -1])
+            log_probs = torch.log_softmax(logits, dim=-1).squeeze(0)
+
+            blocked_ids = get_blocked_tokens(beam["tokens"], n=ngram_block)
+            for bid in blocked_ids:
+                log_probs[bid] = float("-inf")
+            log_probs[pad_idx] = float("-inf")
+
+            topk_logp, topk_idx = log_probs.topk(beam_size)
+
+            for j in range(beam_size):
+                token_id = topk_idx[j].item()
+                token_logp = topk_logp[j].item()
+
+                new_tokens = beam["tokens"] + [token_id]
+                new_logp = beam["logp"] + token_logp
+                finished = token_id == eos_idx
+
+                lp = length_penalty(len(new_tokens), alpha)
+                score = new_logp / lp
+
+                all_candidates.append(
+                    {
+                        "tokens": new_tokens,
+                        "logp": new_logp,
+                        "score": score,
+                        "finished": finished,
+                    }
+                )
+
+        all_candidates.sort(key=lambda x: x["score"], reverse=True)
+        beams = all_candidates[:beam_size]
+
+        if all(b["finished"] for b in beams):
+            break
+
+    best = max(beams, key=lambda x: x["score"])
+    tokens = best["tokens"]
+    if tokens[-1] == eos_idx:
+        tokens = tokens[:-1]
+    return torch.tensor(tokens[1:], dtype=torch.long)
+
+
+# =========================
+
+# DECODE HELPERS
+
+# =========================
+
+
+def decode_tokens(token_ids, tokenizer_tgt):
+    ids = token_ids.cpu().numpy().tolist()
+
+    cleaned = []
+    for tid in ids:
+        if tid in (
+            tokenizer_tgt.token_to_id("[SOS]"),
+            tokenizer_tgt.token_to_id("[EOS]"),
+            tokenizer_tgt.token_to_id("[PAD]"),
+        ):
+            continue
+        cleaned.append(tid)
+
+    if not cleaned:
+        return ""
+
+    text = tokenizer_tgt.decode(cleaned, skip_special_tokens=True)
+    return normalize_text(text)
+
+
+# =========================
+
+# LOAD TOKENIZERS
+
+# =========================
+
+
 def load_tokenizers(config):
-    """Load source and target tokenizers."""
-    tokenizer_src_path = Path(config["tokenizer_file"].format(config["lang_src"]))
-    tokenizer_tgt_path = Path(config["tokenizer_file"].format(config["lang_tgt"]))
+    tokenizer_src = Tokenizer.from_file(
+        str(Path(config["tokenizer_file"].format(config["lang_src"])))
+    )
+    tokenizer_tgt = Tokenizer.from_file(
+        str(Path(config["tokenizer_file"].format(config["lang_tgt"])))
+    )
 
-    if not tokenizer_src_path.exists():
-        raise FileNotFoundError(f"Source tokenizer not found: {tokenizer_src_path}")
-    if not tokenizer_tgt_path.exists():
-        raise FileNotFoundError(f"Target tokenizer not found: {tokenizer_tgt_path}")
-
-    tokenizer_src = Tokenizer.from_file(str(tokenizer_src_path))
-    tokenizer_tgt = Tokenizer.from_file(str(tokenizer_tgt_path))
+    tokenizer_tgt.decoder = ByteLevelDecoder()
 
     return tokenizer_src, tokenizer_tgt
 
 
-def load_model_from_checkpoint(checkpoint_path, config, tokenizer_src, tokenizer_tgt, device):
-    """Load model from a checkpoint file."""
+# =========================
+
+# LOAD MODEL
+
+# =========================
+
+
+def load_model(checkpoint_path, config, tokenizer_src, tokenizer_tgt, device):
     model = transformer_work(
         tokenizer_src.get_vocab_size(),
         tokenizer_tgt.get_vocab_size(),
@@ -81,356 +379,157 @@ def load_model_from_checkpoint(checkpoint_path, config, tokenizer_src, tokenizer
         config["d_model"],
     ).to(device)
 
-    print(f"Loading checkpoint: {checkpoint_path}")
     state = torch.load(checkpoint_path, map_location=device)
-
-    # Handle torch.compile() state dict from older checkpoints (has '_orig_mod.' prefix)
     state_dict = state["model_state_dict"]
-    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
-        print("Removing '_orig_mod.' prefix from torch.compile() checkpoint...")
+
+    if any(k.startswith("_orig_mod.") for k in state_dict):
         state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
 
     model.load_state_dict(state_dict)
+    model.eval()
 
-    epoch = state.get("epoch", "unknown")
-    global_step = state.get("global_step", "unknown")
-    print(f"Loaded model from epoch {epoch}, global step {global_step}")
-
+    print(f"Loaded checkpoint: {checkpoint_path}")
     return model
 
 
-def get_latest_checkpoint(config):
-    """Find the latest checkpoint file based on global_step."""
-    model_folder = f"{config['datasource']}_{config['model_folder']}"
-    checkpoint_dir = Path(model_folder)
+# =========================
 
-    if not checkpoint_dir.exists():
-        return None
+# EVALUATION
 
-    latest_checkpoint = None
-    latest_step = -1
-
-    for checkpoint_file in checkpoint_dir.glob("*.pt"):
-        try:
-            state = torch.load(checkpoint_file, map_location="cpu")
-            if "global_step" in state:
-                step = state["global_step"]
-                if step > latest_step:
-                    latest_step = step
-                    latest_checkpoint = checkpoint_file
-        except Exception as e:
-            print(f"Warning: Could not load {checkpoint_file}: {e}")
-            continue
-
-    if latest_checkpoint:
-        return str(latest_checkpoint)
-    return None
+# =========================
 
 
-def translate_sentence(model, sentence, tokenizer_src, tokenizer_tgt, config, device):
-    """Translate a single sentence."""
-    model.eval()
-
-    # Tokenize the source sentence
-    src_tokens = tokenizer_src.encode(sentence).ids
-
-    # Truncate if too long
-    if len(src_tokens) > config["seq_len"] - 2:
-        src_tokens = src_tokens[: config["seq_len"] - 2]
-
-    # Build encoder input with SOS, EOS, and padding
-    sos_idx = tokenizer_src.token_to_id("[SOS]")
-    eos_idx = tokenizer_src.token_to_id("[EOS]")
-    pad_idx = tokenizer_src.token_to_id("[PAD]")
-
-    enc_num_padding = config["seq_len"] - len(src_tokens) - 2
-    encoder_input = (
-        torch.cat(
-            [
-                torch.tensor([sos_idx], dtype=torch.int64),
-                torch.tensor(src_tokens, dtype=torch.int64),
-                torch.tensor([eos_idx], dtype=torch.int64),
-                torch.tensor([pad_idx] * enc_num_padding, dtype=torch.int64),
-            ]
-        )
-        .unsqueeze(0)
-        .to(device)
-    )
-
-    # Create encoder mask
-    encoder_mask = (encoder_input != pad_idx).unsqueeze(1).unsqueeze(1).int().to(device)
-
-    with torch.no_grad():
-        model_out = greedy_decode(
-            model,
-            encoder_input,
-            encoder_mask,
-            tokenizer_src,
-            tokenizer_tgt,
-            config["seq_len"],
-            device,
-        )
-
-    # Decode the output
-    translation = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
-    return translation
-
-
-def evaluate_on_dataset(
-    model, dataloader, tokenizer_src, tokenizer_tgt, config, device, num_samples=None
+def evaluate(
+    model,
+    dataloader,
+    tokenizer_tgt,
+    config,
+    device,
+    num_samples=None,
+    beam_size=5,
+    alpha=0.6,
 ):
-    """Evaluate model on a dataset and compute metrics."""
     model.eval()
 
-    source_texts = []
-    expected = []
-    predicted = []
+    cer_metric = CharErrorRate()
+    wer_metric = WordErrorRate()
 
-    count = 0
-    total = num_samples if num_samples else len(dataloader)
-
-    print(f"\nEvaluating on {total} samples...")
+    source_texts, expected, predicted = [], [], []
 
     with torch.no_grad():
-        for batch in tqdm(dataloader, total=total, desc="Evaluating"):
-            encoder_input = batch["encoder_input"].to(device).long()
+        for i, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
+            encoder_input = batch["encoder_input"].to(device)
             encoder_mask = batch["encoder_mask"].to(device)
 
-            assert encoder_input.size(0) == 1, "Batch size must be 1 for evaluation"
-
-            model_out = greedy_decode(
+            model_out = beam_search_decode(
                 model,
                 encoder_input,
                 encoder_mask,
-                tokenizer_src,
                 tokenizer_tgt,
                 config["seq_len"],
                 device,
+                beam_size=beam_size,
+                alpha=alpha,
             )
 
-            source_text = batch["src_text"][0]
-            target_text = batch["tgt_text"][0]
-            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+            pred_text = decode_tokens(model_out, tokenizer_tgt)
+            exp_text = normalize_text(batch["tgt_text"][0])
 
-            source_texts.append(source_text)
-            expected.append(target_text)
-            predicted.append(model_out_text)
+            source_texts.append(batch["src_text"][0])
+            expected.append(exp_text)
+            predicted.append(pred_text)
 
-            count += 1
-            if num_samples and count >= num_samples:
+            if num_samples and i >= num_samples:
                 break
 
-    # Compute metrics
+    cer = cer_metric(predicted, expected)
+    wer = wer_metric(predicted, expected)
+    bleu = corpus_bleu(predicted, [[e] for e in expected])
+    cbleu = char_bleu(predicted, [[e] for e in expected])
+
     print("\n" + "=" * 60)
     print("EVALUATION RESULTS")
     print("=" * 60)
-
-    # Character Error Rate
-    cer_metric = torchmetrics.CharErrorRate()
-    cer = cer_metric(predicted, expected)
-    print(f"Character Error Rate (CER): {cer:.4f}")
-
-    # Word Error Rate
-    wer_metric = torchmetrics.WordErrorRate()
-    wer = wer_metric(predicted, expected)
-    print(f"Word Error Rate (WER): {wer:.4f}")
-
-    # BLEU Score
-    bleu_metric = torchmetrics.BLEUScore()
-    bleu = bleu_metric(predicted, expected)
-    print(f"BLEU Score: {bleu:.4f}")
-
+    print(f"CER:       {cer:.4f}")
+    print(f"WER:       {wer:.4f}")
+    print(f"BLEU:      {bleu:.2f}")
+    print(f"char-BLEU: {cbleu:.2f}")
     print("=" * 60)
 
-    return {
-        "cer": cer.item(),
-        "wer": wer.item(),
-        "bleu": bleu.item(),
-        "source_texts": source_texts,
-        "expected": expected,
-        "predicted": predicted,
-    }
+    return source_texts, expected, predicted
 
 
-def show_examples(results, num_examples=5):
-    """Display translation examples."""
-    print(f"\n{'=' * 60}")
-    print(f"SAMPLE TRANSLATIONS (showing {num_examples} examples)")
-    print("=" * 60)
+# =========================
 
-    for i in range(min(num_examples, len(results["source_texts"]))):
-        print(f"\n[Example {i + 1}]")
-        print(f"  SOURCE:    {results['source_texts'][i]}")
-        print(f"  EXPECTED:  {results['expected'][i]}")
-        print(f"  PREDICTED: {results['predicted'][i]}")
-    print()
+# SHOW EXAMPLES
+
+# =========================
 
 
-def interactive_mode(model, tokenizer_src, tokenizer_tgt, config, device):
-    """Interactive translation mode."""
+def show_examples(src, exp, pred, n=5):
     print("\n" + "=" * 60)
-    print("INTERACTIVE TRANSLATION MODE")
-    print(f"Translating from {config['lang_src'].upper()} to {config['lang_tgt'].upper()}")
-    print("Type 'quit' or 'exit' to stop")
-    print("=" * 60 + "\n")
+    print("SAMPLE TRANSLATIONS")
+    print("=" * 60)
 
-    while True:
-        try:
-            sentence = input(f"Enter {config['lang_src'].upper()} sentence: ").strip()
-            if sentence.lower() in ["quit", "exit", "q"]:
-                print("Exiting interactive mode.")
-                break
-            if not sentence:
-                continue
+    for i in range(min(n, len(src))):
+        print(f"\n[Example {i + 1}]")
+        print(f"SOURCE:    {src[i]}")
+        print(f"EXPECTED:  {exp[i]}")
+        print(f"PREDICTED: {pred[i]}")
+        if i < 2:
+            print(f"DEBUG PRED: {repr(pred[i][:120])}")
+            print(f"DEBUG EXP:  {repr(exp[i][:120])}")
 
-            translation = translate_sentence(
-                model, sentence, tokenizer_src, tokenizer_tgt, config, device
-            )
-            print(f"Translation: {translation}\n")
 
-        except KeyboardInterrupt:
-            print("\nExiting interactive mode.")
-            break
+# =========================
+
+# MAIN
+
+# =========================
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate a trained Transformer model from checkpoint"
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint file (default: latest checkpoint)",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=10,
-        help="Number of samples to evaluate (default: 10)",
-    )
-    parser.add_argument(
-        "--show_examples",
-        type=int,
-        default=5,
-        help="Number of examples to display (default: 10)",
-    )
-    parser.add_argument(
-        "--interactive", action="store_true", help="Enable interactive translation mode"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to use (default: cuda if available)",
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--beam_size", type=int, default=5)
+    parser.add_argument("--alpha", type=float, default=0.6)
     args = parser.parse_args()
 
-    # Setup
     config = get_config()
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    print(f"Using device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load tokenizers
-    print("Loading tokenizers...")
     tokenizer_src, tokenizer_tgt = load_tokenizers(config)
-    print(f"Source vocab size: {tokenizer_src.get_vocab_size()}")
-    print(f"Target vocab size: {tokenizer_tgt.get_vocab_size()}")
 
-    # Determine checkpoint path
-    if args.checkpoint:
-        checkpoint_path = args.checkpoint
-        path_obj = Path(checkpoint_path)
+    model = load_model(args.checkpoint, config, tokenizer_src, tokenizer_tgt, device)
 
-        # Try multiple resolution strategies
-        if path_obj.exists():
-            # Path exists as-is (absolute or relative)
-            checkpoint_path = str(path_obj)
-        elif path_obj.is_absolute():
-            # Absolute path provided but doesn't exist
-            print(f"Error: Checkpoint not found at absolute path: {checkpoint_path}")
-            return
-        else:
-            # Try as relative path from current directory
-            if not path_obj.exists():
-                # Try as filename in model folder
-                model_folder = f"{config['datasource']}_{config['model_folder']}"
-                filename_in_folder = Path(model_folder) / checkpoint_path
-                if filename_in_folder.exists():
-                    checkpoint_path = str(filename_in_folder)
-                else:
-                    # Try using get_weights_file_path (for epoch-style names)
-                    resolved_path = get_weights_file_path(config, args.checkpoint)
-                    if Path(resolved_path).exists():
-                        checkpoint_path = resolved_path
-                    else:
-                        print(f"Error: Could not find checkpoint '{args.checkpoint}'")
-                        print("Tried:")
-                        print(f"  1. As-is: {path_obj}")
-                        print(f"  2. In model folder: {filename_in_folder}")
-                        print(f"  3. Resolved path: {resolved_path}")
-                        print("\nAvailable checkpoints:")
-                        checkpoint_dir = Path(model_folder)
-                        if checkpoint_dir.exists():
-                            for f in sorted(checkpoint_dir.glob("*.pt")):
-                                print(f"  - {f.name}")
-                        return
-    else:
-        checkpoint_path = get_latest_checkpoint(config)
-
-    if not checkpoint_path or not Path(checkpoint_path).exists():
-        print(f"Error: Checkpoint not found: {checkpoint_path}")
-        print("Available checkpoints:")
-        model_folder = f"{config['datasource']}_{config['model_folder']}"
-        checkpoint_dir = Path(model_folder)
-        if checkpoint_dir.exists():
-            for f in sorted(checkpoint_dir.glob("*.pt")):
-                print(f"  - {f.name}")
-        return
-
-    # Load model
-    model = load_model_from_checkpoint(
-        checkpoint_path, config, tokenizer_src, tokenizer_tgt, device
+    val_ds_raw: HFDataset = load_dataset(
+        "json", data_files="BanglaNMT/validation.jsonl", split="train"
     )
-    model.eval()
 
-    if args.interactive:
-        # Interactive mode
-        interactive_mode(model, tokenizer_src, tokenizer_tgt, config, device)
-    else:
-        # Evaluation mode
-        print("\nLoading validation dataset...")
-        val_ds_raw: HFDataset = load_dataset(
-            "json", data_files="BanglaNMT/validation.jsonl", split="train"
-        )  # type: ignore
-        val_ds = BilingualDataset(
-            val_ds_raw,
-            tokenizer_src,
-            tokenizer_tgt,
-            config["lang_src"],
-            config["lang_tgt"],
-            config["seq_len"],
-        )
-        val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=False)
-        print(f"Validation dataset size: {len(val_ds)}")
+    val_ds = BilingualDataset(
+        val_ds_raw,
+        tokenizer_src,
+        tokenizer_tgt,
+        config["lang_src"],
+        config["lang_tgt"],
+        config["seq_len"],
+    )
 
-        # Run evaluation
-        results = evaluate_on_dataset(
-            model,
-            val_dataloader,
-            tokenizer_src,
-            tokenizer_tgt,
-            config,
-            device,
-            args.num_samples,
-        )
+    val_loader = DataLoader(val_ds, batch_size=1)
 
-        # Show examples
-        if args.show_examples > 0:
-            show_examples(results, args.show_examples)
+    src, exp, pred = evaluate(
+        model,
+        val_loader,
+        tokenizer_tgt,
+        config,
+        device,
+        args.num_samples,
+        beam_size=args.beam_size,
+        alpha=args.alpha,
+    )
+
+    show_examples(src, exp, pred)
 
 
 if __name__ == "__main__":
